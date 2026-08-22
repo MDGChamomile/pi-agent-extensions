@@ -28,6 +28,7 @@
 ├── fetch.ts            # HTTP request tool extension
 ├── questionnaire.ts    # Multi-question tool for LLM-driven user input
 ├── slow-mode.ts        # Review gate for write/edit tool calls
+├── AGENTS.md           # Agent context for AI assistants
 ├── README.org          # Project README
 ├── air-config.toml     # Air configuration
 └── air/                # Air documentation
