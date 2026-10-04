@@ -11,7 +11,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme, ReadonlyFooterDataProvider } from "@mariozechner/pi-coding-agent";
 import { loadSettings, saveSettings, clearCache } from "./src/settings.js";
 import { renderBar, buildBarContext, invalidateVcs, setExtensionStatuses } from "./src/bar.js";
-import { setVcsUpdateCallback } from "./src/vcs.js";
+import { invalidateVcsForRepoCreation, setVcsUpdateCallback } from "./src/vcs.js";
 import { detectProvider, createUsageController, setApiKeyResolver, resetRateLimit } from "./src/providers.js";
 import { getCached } from "./src/cache.js";
 
@@ -24,7 +24,6 @@ export default function statusline(pi: ExtensionAPI) {
 	let enabled = true;
 	let currentCtx: ExtensionContext | undefined;
 	let tuiRef: any = null;
-	let getThinkingLevelFn: (() => string) | null = null;
 
 	// ── Usage controller ─────────────────────────────────────────────────
 
@@ -32,12 +31,12 @@ export default function statusline(pi: ExtensionAPI) {
 		renderWidget();
 	});
 
-	/** Get usage: in-memory first, then file cache fallback. */
+	/** Get usage for the active provider only, then fall back to its file cache. */
 	function getUsage() {
-		const mem = usage.current();
-		if (mem) return mem;
 		const provider = currentProvider();
 		if (!provider) return undefined;
+		const mem = usage.current();
+		if (mem?.provider === provider) return mem;
 		return getCached(provider, 5 * 60 * 1000);
 	}
 
@@ -46,7 +45,7 @@ export default function statusline(pi: ExtensionAPI) {
 			return detectProvider(currentCtx?.model);
 		} catch {
 			// ctx is stale after session replacement/reload; drop it and wait
-			// for the next session_start/model_update to re-set it.
+			// for the next session_start/model_select to re-set it.
 			currentCtx = undefined;
 			return undefined;
 		}
@@ -91,7 +90,7 @@ export default function statusline(pi: ExtensionAPI) {
 			(_tui: any, theme: Theme) => ({
 				render(width: number) {
 					if (!currentCtx) return [];
-					const thinkingLevel = getThinkingLevelFn?.() ?? "off";
+					const thinkingLevel = pi.getThinkingLevel();
 					const subUsage = settings.showUsage ? getUsage() : undefined;
 					const barCtx = buildBarContext(currentCtx, thinkingLevel, subUsage, settings.contextFormat);
 					const line = renderBar(theme, barCtx, width);
@@ -139,7 +138,7 @@ export default function statusline(pi: ExtensionAPI) {
 	// ── VCS invalidation on file changes ─────────────────────────────────
 
 	const VCS_CHANGE_PATTERNS = [
-		/\b(git|jj)\s+(checkout|switch|branch|merge|rebase|pull|reset|new|edit|abandon|squash|split|move|bookmark)\b/,
+		/\b(git|jj)\s+(init|checkout|switch|branch|merge|rebase|pull|reset|new|edit|abandon|squash|split|move|bookmark)\b/,
 		/\bjj\s+(describe|commit|undo|restore)\b/,
 		/\bgit\s+stash\s+(pop|apply)\b/,
 	];
@@ -148,14 +147,18 @@ export default function statusline(pi: ExtensionAPI) {
 		return VCS_CHANGE_PATTERNS.some((p) => p.test(cmd));
 	}
 
+	function mightCreateRepo(cmd: string): boolean {
+		// Accept common global-option forms such as `git -C . init` and
+		// `git -c init.defaultBranch=main init` without attempting shell parsing.
+		return /\b(?:git|jj)\b[^\n;|&]*\sinit(?=\s|$)/.test(cmd);
+	}
+
 	// ── Events ───────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		settings = loadSettings();
 		clearCache();
-		getThinkingLevelFn =
-			typeof (ctx as any).getThinkingLevel === "function" ? () => (ctx as any).getThinkingLevel() : null;
 
 		// PI_STATUSLINE=minimal disables usage fetching
 		if (process.env.PI_STATUSLINE === "minimal") {
@@ -174,6 +177,7 @@ export default function statusline(pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", async () => {
+		if (!enabled || !settings.showUsage) return;
 		const provider = currentProvider();
 		if (provider) {
 			usage.refresh(provider).catch(() => {});
@@ -186,7 +190,7 @@ export default function statusline(pi: ExtensionAPI) {
 		}
 		if (event.toolName === "bash" && (event.input as any)?.command) {
 			const cmd = String((event.input as any).command);
-			if (mightChangeVcs(cmd)) {
+			if (mightCreateRepo(cmd) || mightChangeVcs(cmd)) {
 				invalidateVcs();
 				setTimeout(() => tuiRef?.requestRender(), 100);
 			}
@@ -194,19 +198,29 @@ export default function statusline(pi: ExtensionAPI) {
 	});
 
 	pi.on("user_bash", async (event) => {
-		if (mightChangeVcs(event.command)) {
-			invalidateVcs();
+		const createsRepo = mightCreateRepo(event.command);
+		if (createsRepo || mightChangeVcs(event.command)) {
+			// user_bash is emitted before execution. For init, keep negative repo
+			// lookups transient so the host's command-completion render can detect
+			// the repository even when the command takes longer than these redraws.
+			if (createsRepo) invalidateVcsForRepoCreation();
+			else invalidateVcs();
 			setTimeout(() => tuiRef?.requestRender(), 150);
 			setTimeout(() => tuiRef?.requestRender(), 500);
 		}
 	});
 
-	pi.on("model_update" as any, async (_event: any, ctx: ExtensionContext) => {
+	pi.on("model_select", async (_event, ctx) => {
 		currentCtx = ctx;
-		const provider = currentProvider();
-		if (provider) {
-			usage.refresh(provider).catch(() => {});
+		if (enabled && settings.showUsage) {
+			const provider = currentProvider();
+			if (provider) usage.refresh(provider).catch(() => {});
 		}
+		renderWidget();
+		tuiRef?.requestRender();
+	});
+
+	pi.on("thinking_level_select", async () => {
 		renderWidget();
 		tuiRef?.requestRender();
 	});
@@ -235,9 +249,7 @@ export default function statusline(pi: ExtensionAPI) {
 				enabled = !enabled;
 				if (enabled) {
 					setupFooter(ctx);
-					const provider = currentProvider();
-					if (provider) usage.refresh(provider).catch(() => {});
-					usage.start(currentProvider);
+					if (settings.showUsage) await initUsage(ctx);
 					renderWidget();
 					ctx.ui.notify("Statusline enabled", "info");
 				} else {
@@ -253,6 +265,12 @@ export default function statusline(pi: ExtensionAPI) {
 			if (arg === "usage") {
 				settings.showUsage = !settings.showUsage;
 				saveSettings(settings);
+				if (settings.showUsage && enabled) {
+					await initUsage(ctx);
+				} else {
+					usage.stop();
+					setApiKeyResolver(undefined);
+				}
 				renderWidget();
 				ctx.ui.notify(`Usage: ${settings.showUsage ? "on" : "off"}`, "info");
 				return;
